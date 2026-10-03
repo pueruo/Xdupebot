@@ -49,7 +49,7 @@ def enhance_image(image: Image.Image) -> Image.Image:
         image = image.convert("RGB")
 
     width, height = image.size
-    crop = random.uniform(0.04, 0.08)
+    crop = random.uniform(0.006, 0.015)   # ← sirf yahan soft kiya
     left = int(width * crop * random.uniform(0.2, 0.9))
     top = int(height * crop * random.uniform(0.2, 0.9))
     right = width - int(width * crop * random.uniform(0.2, 0.9))
@@ -112,7 +112,7 @@ def enhance_video(input_path: str, output_path: str) -> bool:
     gamma = random.uniform(0.95, 1.06)
     hue = random.uniform(-4, 4)
     noise_str = random.randint(4, 9)
-    crop_pct = random.uniform(0.010, 0.018)
+    crop_pct = random.uniform(0.005, 0.012)   # ← sirf yahan soft kiya
 
     vf = (
         f"crop=iw*(1-{crop_pct}):ih*(1-{crop_pct}),"
