@@ -6,6 +6,7 @@ import re
 import subprocess
 import shutil
 import sqlite3
+import sys
 from datetime import datetime, date, timedelta
 from threading import Thread
 from flask import Flask
@@ -44,6 +45,7 @@ if not BOT_TOKEN:
 ADMIN_USERNAME = "pvnuo"
 DAILY_FREE_LIMIT = 5
 DB_FILE = "bot_data.db"
+MAX_TG_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 20MB Telegram Bot API limit
 # ====================================================
 
 # ------------------------------------------------------
@@ -87,7 +89,7 @@ def is_global_free() -> bool:
     c.execute("SELECT value FROM settings WHERE key = 'global_free'")
     row = c.fetchone()
     conn.close()
-    return row and row[0] == "1"
+    return bool(row and row[0] == "1")
 
 def set_global_free(enabled: bool):
     conn = sqlite3.connect(DB_FILE)
@@ -138,7 +140,7 @@ def is_paid_user(user_id: int) -> bool:
     try:
         expiry = date.fromisoformat(row[0])
         return expiry >= date.today()
-    except:
+    except Exception:
         return False
 
 def add_paid_user(user_id: int, days: int):
@@ -154,7 +156,7 @@ def add_paid_user(user_id: int, days: int):
                 new_expiry = current_expiry + timedelta(days=days)
             else:
                 new_expiry = date.today() + timedelta(days=days)
-        except:
+        except Exception:
             new_expiry = date.today() + timedelta(days=days)
     else:
         new_expiry = date.today() + timedelta(days=days)
@@ -222,7 +224,7 @@ def keep_alive():
     t.start()
 
 # ------------------------------------------------------
-# Image enhance (strong + no content loss)
+# Image enhance
 # ------------------------------------------------------
 def enhance_image(image: Image.Image) -> Image.Image:
     if image.mode != "RGB":
@@ -276,9 +278,17 @@ def enhance_image(image: Image.Image) -> Image.Image:
     return clean
 
 # ------------------------------------------------------
-# Video enhance (safe + strong + no content loss)
+# Video enhance
 # ------------------------------------------------------
+def check_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
 def enhance_video(input_path: str, output_path: str) -> bool:
+    if not check_ffmpeg():
+        print("CRITICAL: ffmpeg binary not found in system PATH.", flush=True)
+        return False
+
+    # preset=veryfast and threads=2 prevent OOM terminates on shared memory slices
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
@@ -286,10 +296,11 @@ def enhance_video(input_path: str, output_path: str) -> bool:
         "-map", "0:v:0",
         "-map", "0:a:0?",
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "veryfast",
+        "-threads", "2",
+        "-crf", "22",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-b:a", "128k",
         "-movflags", "+faststart",
         "-pix_fmt", "yuv420p",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
@@ -300,63 +311,59 @@ def enhance_video(input_path: str, output_path: str) -> bool:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=600,
+            timeout=300,
             text=True
         )
         if result.returncode != 0:
-            print("===== FFMPEG ERROR =====")
-            print(result.stderr[-2000:] if result.stderr else "No stderr")
+            print("===== FFMPEG ERROR =====", flush=True)
+            print(result.stderr[-2000:] if result.stderr else "No stderr", flush=True)
             return False
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
     except Exception as e:
-        print(f"FFmpeg Exception: {e}")
+        print(f"FFmpeg Exception: {e}", flush=True)
         return False
 
 def compress_video_if_needed(path: str, unique_id: str, max_mb: float = 45.0) -> str:
-    """Compress until under Telegram safe limit. Returns final path."""
-    if not os.path.exists(path):
+    if not os.path.exists(path) or not check_ffmpeg():
         return path
     size = os.path.getsize(path)
     limit = int(max_mb * 1024 * 1024)
     if size <= limit:
         return path
-    crfs = [23, 26, 28, 30, 32, 35]
+    crfs = [26, 28, 30, 32, 35]
     current = path
     for i, crf in enumerate(crfs):
         out = f"comp_{unique_id}_{i}.mp4"
         cmd = [
             "ffmpeg", "-y", "-i", current,
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:v", "libx264", "-preset", "faster", "-crf", str(crf),
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2", "-crf", str(crf),
+            "-c:a", "aac", "-b:a", "96k",
             "-movflags", "+faststart",
             "-pix_fmt", "yuv420p",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             out
         ]
         try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 10000:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 1000:
                 if current != path and os.path.exists(current):
                     try:
                         os.remove(current)
-                    except:
+                    except Exception:
                         pass
                 current = out
                 if os.path.getsize(current) <= limit:
                     return current
         except Exception as e:
-            print(f"compress pass {i}: {e}")
+            print(f"compress pass {i}: {e}", flush=True)
     return current
 
 async def safe_send_video(message, path: str, caption: str, unique_id: str):
-    """Prefer video. On size / 413 / any send fail → document. Always try document last."""
     path = compress_video_if_needed(path, unique_id, max_mb=45.0)
     if not os.path.exists(path):
         return False
     size = os.path.getsize(path)
-
-    # force document path for anything that looks risky
     force_doc = size > 40 * 1024 * 1024
 
     try:
@@ -381,11 +388,9 @@ async def safe_send_video(message, path: str, caption: str, unique_id: str):
                 )
         return True
     except Exception as e:
-        err = str(e).lower()
-        print(f"safe_send_video first try: {e}")
-        # any failure → document
+        print(f"safe_send_video failure: {e}", flush=True)
         try:
-            path2 = compress_video_if_needed(path, unique_id + "_r", max_mb=38.0)
+            path2 = compress_video_if_needed(path, unique_id + "_r", max_mb=35.0)
             with open(path2, "rb") as vid:
                 await message.reply_document(
                     document=vid,
@@ -397,7 +402,7 @@ async def safe_send_video(message, path: str, caption: str, unique_id: str):
                 )
             return True
         except Exception as e2:
-            print(f"document fallback failed: {e2}")
+            print(f"document fallback failed: {e2}", flush=True)
             return False
 
 # ------------------------------------------------------
@@ -444,9 +449,9 @@ async def freeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=target_id,
                 text="🎉 You now have unlimited access to this bot forever!\nEnjoy."
             )
-        except:
+        except Exception:
             pass
-    except Exception as e:
+    except Exception:
         await update.message.reply_text(
             f"❌ Could not find user.\n\n"
             f"Possible reasons:\n"
@@ -482,9 +487,9 @@ async def removefree(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=target_id,
                 text="Your unlimited access has been removed.\nYou are now on the free daily limit (5 links per day)."
             )
-        except:
+        except Exception:
             pass
-    except Exception as e:
+    except Exception:
         await update.message.reply_text(
             f"❌ Could not find user.\n\n"
             f"User must have started the bot at least once.\n"
@@ -497,7 +502,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     global_free = is_global_free()
     free_list = get_lifetime_free_list()
+    ffmpeg_ready = check_ffmpeg()
     text = f"📊 Bot Status\n\n"
+    text += f"FFmpeg Installed: {'YES ✅' if ffmpeg_ready else 'NO ❌ (Railway nixpacks.toml needed)'}\n"
     text += f"Global Free Mode: {'ON ✅' if global_free else 'OFF (Daily limit active)'}\n"
     text += f"Daily Free Limit: {DAILY_FREE_LIMIT}\n\n"
     text += f"Lifetime Free Users ({len(free_list)}):\n"
@@ -510,7 +517,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     username_str = f" (@{chat.username})"
                 elif chat.first_name:
                     username_str = f" ({chat.first_name})"
-            except:
+            except Exception:
                 pass
             text += f"• {uid}{username_str}\n"
     else:
@@ -554,13 +561,11 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         description = "Get unlimited downloads for 30 days"
         payload = "plan_30"
         prices = [LabeledPrice("30 Days Unlimited", 79)]
-        days = 30
     elif data == "buy_90":
         title = "3 Months Unlimited Access"
         description = "Get unlimited downloads for 90 days"
         payload = "plan_90"
         prices = [LabeledPrice("3 Months Unlimited", 249)]
-        days = 90
     else:
         return
     
@@ -654,7 +659,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_custom("6201528571756815592")
 
     text = "".join(text_parts)
-    await update.message.reply_text(text, entities=entities, reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None))
+    await update.message.reply_text(
+        text, 
+        entities=entities, 
+        reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None)
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_parts = []
@@ -698,64 +707,29 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_text("For any help contact @pvnuo")
 
     text = "".join(text_parts)
-    await update.message.reply_text(text, entities=entities, reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None))
+    await update.message.reply_text(
+        text, 
+        entities=entities, 
+        reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None)
+    )
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text_parts = []
-    entities = []
-    current_offset = 0
-
-    def add_text(s: str):
-        nonlocal current_offset
-        text_parts.append(s)
-        current_offset += len(s.encode("utf-16-le")) // 2
-
-    def add_custom(emoji_id: str, placeholder: str = "🔥"):
-        nonlocal current_offset
-        text_parts.append(placeholder)
-        length = len(placeholder.encode("utf-16-le")) // 2
-        entities.append(MessageEntity(
-            type=MessageEntity.CUSTOM_EMOJI,
-            offset=current_offset,
-            length=length,
-            custom_emoji_id=str(emoji_id)
-        ))
-        current_offset += length
-
-    add_text("About this Bot:\n\n")
-    add_text("• Send any image or video and get a cleaned unique version (no content loss).\n")
-    add_text("• Helps reduce AI labels and unoriginal content strikes while keeping high quality.\n")
-    add_text("• You can also send any ")
-    add_custom("6201514939530618666")
-    add_text(" Instagram, ")
-    add_custom("6204008550298033491")
-    add_text(" TikTok or ")
-    add_custom("6203873525116183636")
-    add_text(" Twitter/X link and I will download the media in original quality.\n\n")
-    add_text("In groups: mention me with the photo, video or link.\n\n")
-    add_text("For any help contact @pvnuo ")
-    add_custom("6201528571756815592")
-
-    text = "".join(text_parts)
-    await update.message.reply_text(text, entities=entities, reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None))
+    text = (
+        "About this Bot:\n\n"
+        "• Send any image or video and get a cleaned unique version (no content loss).\n"
+        "• Helps reduce AI labels and unoriginal content strikes while keeping high quality.\n"
+        "• You can also send Instagram, TikTok or Twitter/X links to download original media.\n\n"
+        "For any help contact @pvnuo"
+    )
+    await update.message.reply_text(text, reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None))
 
 async def how(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "How it works:\n\n"
-        "Photo mode:\n"
-        "1. You send a photo\n"
-        "2. I apply light unique modifications (no crop)\n"
-        "3. You get a new high-quality version\n\n"
-        "Video mode:\n"
-        "1. You send a video\n"
-        "2. I apply light unique changes (no crop)\n"
-        "3. You get a high-quality unique version\n\n"
-        "Link mode (Instagram / TikTok / Twitter/X):\n"
-        "1. You send a link\n"
-        "2. I download the media in original quality\n"
-        "3. You receive it\n\n"
-        "In groups: always mention me.\n\n"
-        "For any help contact @pvnuo"
+        "Photo mode: Light unique modifications applied without cropping.\n"
+        "Video mode: Metadata stripped, frame timings adjusted, re-encoded in original spec.\n"
+        "Links: Automatic stream discovery and download.\n\n"
+        "Note: Telegram restricts direct bot downloads to files under 20 MB."
     )
     await update.message.reply_text(text, reply_markup=get_user_keyboard(update.effective_user.username if update.effective_user else None))
 
@@ -770,12 +744,12 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = (await context.bot.get_me()).username.lower()
         caption = (message.caption or "").lower()
         mentioned = f"@{bot_username}" in caption
-        is_reply = False
-        if message.reply_to_message and message.reply_to_message.from_user:
-            if (message.reply_to_message.from_user.is_bot and
-                message.reply_to_message.from_user.username and
-                message.reply_to_message.from_user.username.lower() == bot_username):
-                is_reply = True
+        is_reply = bool(
+            message.reply_to_message and 
+            message.reply_to_message.from_user and 
+            message.reply_to_message.from_user.is_bot and 
+            (message.reply_to_message.from_user.username or "").lower() == bot_username
+        )
         if not mentioned and not is_reply:
             return
 
@@ -803,13 +777,13 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         try:
             await status_msg.delete()
-        except:
+        except Exception:
             pass
     except Exception as e:
-        print(f"Image error: {e}")
+        print(f"Image error: {e}", flush=True)
         try:
             await status_msg.edit_text("❌ Failed to process the image.")
-        except:
+        except Exception:
             await message.reply_text("❌ Failed to process the image.")
 
 # ------------------------------------------------------
@@ -823,29 +797,50 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = (await context.bot.get_me()).username.lower()
         caption = (message.caption or "").lower()
         mentioned = f"@{bot_username}" in caption
-        is_reply = False
-        if message.reply_to_message and message.reply_to_message.from_user:
-            if (message.reply_to_message.from_user.is_bot and
-                message.reply_to_message.from_user.username and
-                message.reply_to_message.from_user.username.lower() == bot_username):
-                is_reply = True
+        is_reply = bool(
+            message.reply_to_message and 
+            message.reply_to_message.from_user and 
+            message.reply_to_message.from_user.is_bot and 
+            (message.reply_to_message.from_user.username or "").lower() == bot_username
+        )
         if not mentioned and not is_reply:
             return
 
-    status_msg = await message.reply_text("⌛")
+    status_msg = await message.reply_text("⌛ Checking file...")
+    
+    # Check 1: FFmpeg installation verification
+    if not check_ffmpeg():
+        print("ERROR: User sent video but ffmpeg is missing from Railway container.", flush=True)
+        await status_msg.edit_text(
+            "❌ Server configuration error: `ffmpeg` is not installed on this host.\n"
+            "Deploy `nixpacks.toml` to Railway with `nixPkgs = ['ffmpeg']`."
+        )
+        return
+
+    # Check 2: Telegram Bot API 20 MB size constraint
+    target_obj = message.video or (message.document if message.document and "video" in (message.document.mime_type or "") else None)
+    if not target_obj:
+        await status_msg.edit_text("❌ Unsupported video format.")
+        return
+
+    if target_obj.file_size and target_obj.file_size > MAX_TG_DOWNLOAD_BYTES:
+        size_mb = round(target_obj.file_size / (1024 * 1024), 1)
+        await status_msg.edit_text(
+            f"❌ File too large ({size_mb} MB).\n"
+            f"Telegram Bot API limits direct bot downloads to 20 MB max.\n"
+            f"Compress or trim the video before sending."
+        )
+        return
+
+    await status_msg.edit_text("⌛ Processing video...")
     unique_id = str(int(time.time() * 1000))
     input_path = f"input_{unique_id}.mp4"
     output_path = f"output_{unique_id}.mp4"
-    try:
-        if message.video:
-            file = await context.bot.get_file(message.video.file_id)
-        elif message.document and message.document.mime_type and "video" in message.document.mime_type:
-            file = await context.bot.get_file(message.document.file_id)
-        else:
-            await status_msg.edit_text("❌ Unsupported video format.")
-            return
 
+    try:
+        file = await context.bot.get_file(target_obj.file_id)
         await file.download_to_drive(input_path)
+
         success = enhance_video(input_path, output_path)
 
         if success and os.path.exists(output_path):
@@ -855,30 +850,30 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ok:
                 try:
                     await status_msg.delete()
-                except:
+                except Exception:
                     pass
             else:
-                await status_msg.edit_text("❌ Failed to process the video.")
+                await status_msg.edit_text("❌ Failed to transmit processed video.")
         else:
-            await status_msg.edit_text("❌ Failed to process the video.")
+            await status_msg.edit_text("❌ Transcode failed. Check codec compatibility.")
     except Exception as e:
-        print(f"Video error: {e}")
+        print(f"Video pipeline exception: {e}", flush=True)
         try:
-            await status_msg.edit_text("❌ Failed to process the video.")
-        except:
+            await status_msg.edit_text(f"❌ Failed to process video: {str(e)[:100]}")
+        except Exception:
             pass
     finally:
         for p in [input_path, output_path]:
             if os.path.exists(p):
                 try:
                     os.remove(p)
-                except:
+                except Exception:
                     pass
         for f in os.listdir("."):
             if f.startswith(f"compressed_{unique_id}") or f.startswith(f"comp_{unique_id}"):
                 try:
                     os.remove(f)
-                except:
+                except Exception:
                     pass
 
 # ------------------------------------------------------
@@ -907,7 +902,7 @@ def download_instagram(url: str, unique_id: str):
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except Exception as e:
-        print(f"Instaloader error: {e}")
+        print(f"Instaloader error: {e}", flush=True)
         return []
     paths = []
     folder = f"temp_{unique_id}"
@@ -919,39 +914,14 @@ def download_instagram(url: str, unique_id: str):
             if file.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4")):
                 paths.append(full)
     except Exception as e:
-        print(f"Download post error: {e}")
+        print(f"Download post error: {e}", flush=True)
     return paths
 
 # ------------------------------------------------------
 # TikTok
 # ------------------------------------------------------
 async def download_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    text_parts = []
-    entities = []
-    current_offset = 0
-
-    def add_text(s: str):
-        nonlocal current_offset
-        text_parts.append(s)
-        current_offset += len(s.encode("utf-16-le")) // 2
-
-    def add_custom(emoji_id: str, placeholder: str = "🔥"):
-        nonlocal current_offset
-        text_parts.append(placeholder)
-        length = len(placeholder.encode("utf-16-le")) // 2
-        entities.append(MessageEntity(
-            type=MessageEntity.CUSTOM_EMOJI,
-            offset=current_offset,
-            length=length,
-            custom_emoji_id=str(emoji_id)
-        ))
-        current_offset += length
-
-    add_text("Downloading from ")
-    add_custom("6204008550298033491")
-    add_text(" TikTok...")
-
-    status_text = await update.message.reply_text("".join(text_parts), entities=entities)
+    status_text = await update.message.reply_text("Downloading from TikTok...")
     status_emoji = await update.message.reply_text("⌛")
 
     unique_id = str(int(time.time() * 1000))
@@ -970,7 +940,7 @@ async def download_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
             "retries": 10,
             "fragment_retries": 10,
             "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
                 "Referer": "https://www.tiktok.com/",
             },
         }
@@ -985,26 +955,8 @@ async def download_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
                         paths.append(candidate)
                         break
         except Exception as e:
-            print(f"yt-dlp TikTok: {e}")
-        has_video = any(p.lower().endswith((".mp4", ".mkv", ".webm")) for p in paths)
-        if not has_video:
-            try:
-                cmd = [
-                    "gallery-dl",
-                    "--dest", folder,
-                    "--filename", "{id}_{num}.{extension}",
-                    "--no-mtime",
-                    url
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-                if result.returncode == 0:
-                    for root, _, files in os.walk(folder):
-                        for f in files:
-                            full = os.path.join(root, f)
-                            if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mp3")):
-                                paths.append(full)
-            except Exception as e:
-                print(f"gallery-dl error: {e}")
+            print(f"yt-dlp TikTok: {e}", flush=True)
+
         images = [p for p in paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
         videos = [p for p in paths if p.lower().endswith((".mp4", ".mkv", ".webm"))]
         audios = [p for p in paths if p.lower().endswith((".mp3", ".m4a"))]
@@ -1031,76 +983,35 @@ async def download_tiktok(update: Update, context: ContextTypes.DEFAULT_TYPE, ur
             try:
                 await status_text.delete()
                 await status_emoji.delete()
-            except:
+            except Exception:
                 pass
         else:
-            try:
-                await status_text.edit_text("❌ Failed to download. Make sure the link is public.")
-                await status_emoji.delete()
-            except:
-                pass
+            await status_text.edit_text("❌ Failed to download. Make sure the link is public.")
+            await status_emoji.delete()
     except Exception as e:
-        print(f"TikTok error: {e}")
+        print(f"TikTok error: {e}", flush=True)
         try:
             await status_text.edit_text(f"❌ Failed to download TikTok.\n{str(e)[:120]}")
             await status_emoji.delete()
-        except:
+        except Exception:
             pass
     finally:
         for f in opened_files:
             try:
                 f.close()
-            except:
+            except Exception:
                 pass
         if os.path.exists(folder):
             try:
                 shutil.rmtree(folder, ignore_errors=True)
-            except:
+            except Exception:
                 pass
-        try:
-            for item in os.listdir("."):
-                if item.startswith(f"tt_{unique_id}") or item.startswith(f"temp_{unique_id}"):
-                    path = os.path.join(".", item)
-                    try:
-                        if os.path.isdir(path):
-                            shutil.rmtree(path, ignore_errors=True)
-                        else:
-                            os.remove(path)
-                    except:
-                        pass
-        except:
-            pass
 
 # ------------------------------------------------------
 # Twitter / X
 # ------------------------------------------------------
 async def download_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    text_parts = []
-    entities = []
-    current_offset = 0
-
-    def add_text(s: str):
-        nonlocal current_offset
-        text_parts.append(s)
-        current_offset += len(s.encode("utf-16-le")) // 2
-
-    def add_custom(emoji_id: str, placeholder: str = "🔥"):
-        nonlocal current_offset
-        text_parts.append(placeholder)
-        length = len(placeholder.encode("utf-16-le")) // 2
-        entities.append(MessageEntity(
-            type=MessageEntity.CUSTOM_EMOJI,
-            offset=current_offset,
-            length=length,
-            custom_emoji_id=str(emoji_id)
-        ))
-        current_offset += length
-
-    add_text("Downloading from ")
-    add_custom("6203873525116183636")
-    add_text(" Twitter/X...")
-
-    status_text = await update.message.reply_text("".join(text_parts), entities=entities)
+    status_text = await update.message.reply_text("Downloading from Twitter/X...")
     status_emoji = await update.message.reply_text("⌛")
 
     unique_id = str(int(time.time() * 1000))
@@ -1119,50 +1030,30 @@ async def download_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             "retries": 10,
             "fragment_retries": 10,
             "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
                 "Referer": "https://x.com/",
             },
         }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if "entries" in info:
-                    for entry in info["entries"]:
-                        if entry:
-                            filename = ydl.prepare_filename(entry)
-                            base = filename.rsplit(".", 1)[0]
-                            for ext in [".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"]:
-                                candidate = base + ext
-                                if os.path.exists(candidate):
-                                    paths.append(candidate)
-                else:
-                    filename = ydl.prepare_filename(info)
-                    base = filename.rsplit(".", 1)[0]
-                    for ext in [".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"]:
-                        candidate = base + ext
-                        if os.path.exists(candidate):
-                            paths.append(candidate)
-                            break
-        except Exception as e:
-            print(f"yt-dlp Twitter: {e}")
-        if not paths:
-            try:
-                cmd = [
-                    "gallery-dl",
-                    "--dest", folder,
-                    "--filename", "{id}_{num}.{extension}",
-                    "--no-mtime",
-                    url
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-                if result.returncode == 0:
-                    for root, _, files in os.walk(folder):
-                        for f in files:
-                            full = os.path.join(root, f)
-                            if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mkv", ".webm")):
-                                paths.append(full)
-            except Exception as e:
-                print(f"gallery-dl Twitter error: {e}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if "entries" in info:
+                for entry in info["entries"]:
+                    if entry:
+                        filename = ydl.prepare_filename(entry)
+                        base = filename.rsplit(".", 1)[0]
+                        for ext in [".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"]:
+                            candidate = base + ext
+                            if os.path.exists(candidate):
+                                paths.append(candidate)
+            else:
+                filename = ydl.prepare_filename(info)
+                base = filename.rsplit(".", 1)[0]
+                for ext in [".mp4", ".mkv", ".webm", ".jpg", ".jpeg", ".png", ".webp"]:
+                    candidate = base + ext
+                    if os.path.exists(candidate):
+                        paths.append(candidate)
+                        break
+
         images = [p for p in paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
         videos = [p for p in paths if p.lower().endswith((".mp4", ".mkv", ".webm"))]
         success = False
@@ -1184,45 +1075,29 @@ async def download_twitter(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             try:
                 await status_text.delete()
                 await status_emoji.delete()
-            except:
+            except Exception:
                 pass
         else:
-            try:
-                await status_text.edit_text("❌ Failed to download. Make sure the link is public.")
-                await status_emoji.delete()
-            except:
-                pass
+            await status_text.edit_text("❌ Failed to download. Make sure the link is public.")
+            await status_emoji.delete()
     except Exception as e:
-        print(f"Twitter error: {e}")
+        print(f"Twitter error: {e}", flush=True)
         try:
             await status_text.edit_text(f"❌ Failed to download Twitter/X.\n{str(e)[:120]}")
             await status_emoji.delete()
-        except:
+        except Exception:
             pass
     finally:
         for f in opened_files:
             try:
                 f.close()
-            except:
+            except Exception:
                 pass
         if os.path.exists(folder):
             try:
                 shutil.rmtree(folder, ignore_errors=True)
-            except:
+            except Exception:
                 pass
-        try:
-            for item in os.listdir("."):
-                if item.startswith(f"tw_{unique_id}") or item.startswith(f"temp_{unique_id}"):
-                    path = os.path.join(".", item)
-                    try:
-                        if os.path.isdir(path):
-                            shutil.rmtree(path, ignore_errors=True)
-                        else:
-                            os.remove(path)
-                    except:
-                        pass
-        except:
-            pass
 
 # ------------------------------------------------------
 # Text handler
@@ -1236,7 +1111,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else 0
     username = user.username if user else None
 
-    # Keyboard button handling
     if text == "How to use":
         await how(update, context)
         return
@@ -1249,7 +1123,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "Help":
         await help_command(update, context)
         return
-    # Admin keyboard buttons (only work if already admin-checked inside handlers)
     if text == "Status":
         await status(update, context)
         return
@@ -1260,92 +1133,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await removefreeall(update, context)
         return
     if text == "Free User":
-        await update.message.reply_text(
-            "Usage:\n"
-            "/freeuser @username\n"
-            "/freeuser 123456789\n\n"
-            "Note: User must have started the bot at least once."
-        )
+        await update.message.reply_text("Usage:\n/freeuser @username\n/freeuser 123456789")
         return
     if text == "Remove Free":
-        await update.message.reply_text(
-            "Usage:\n"
-            "/removefree @username\n"
-            "/removefree 123456789"
-        )
+        await update.message.reply_text("Usage:\n/removefree @username\n/removefree 123456789")
         return
 
     if not text.startswith("http"):
         await message.reply_text(
-            "About this Bot:\n\n"
-            "• Just send me any image or video and I will give you a cleaned unique version.\n"
-            "• The changes help reduce AI labels and unoriginal content strikes while keeping high visual quality.\n"
-            "• You can also send any Instagram, TikTok or Twitter/X link and I will download the media for you in original quality.\n\n"
-            "In groups: You must mention me with the photo, video or link.\n\n"
-            "For any help contact @pvnuo",
+            "Send an image or video directly, or supply an Instagram, TikTok, or Twitter/X URL.",
             reply_markup=get_user_keyboard(username)
         )
         return
 
-    # ===== LIMIT CHECK =====
     allowed, limit_msg = can_use_bot(user_id, username)
     if not allowed:
         await message.reply_text(limit_msg)
         return
-    if message.chat.type in ["group", "supergroup"]:
-        bot_username = (await context.bot.get_me()).username.lower()
-        mentioned = f"@{bot_username}" in text.lower()
-        is_reply = False
-        if message.reply_to_message and message.reply_to_message.from_user:
-            if (message.reply_to_message.from_user.is_bot and
-                message.reply_to_message.from_user.username and
-                message.reply_to_message.from_user.username.lower() == bot_username):
-                is_reply = True
-        if not mentioned and not is_reply:
-            return
+
     lower = text.lower()
-    # Twitter / X
-    if "twitter.com" in lower or "x.com" in lower or "t.co" in lower:
+    if any(d in lower for d in ["twitter.com", "x.com", "t.co"]):
         increment_usage(user_id)
         await download_twitter(update, context, text)
         return
-    # TikTok
-    if "tiktok.com" in lower or "vt.tiktok.com" in lower or "vm.tiktok.com" in lower:
+    if any(d in lower for d in ["tiktok.com", "vt.tiktok.com", "vm.tiktok.com"]):
         increment_usage(user_id)
         await download_tiktok(update, context, text)
         return
-    # Instagram
     if "instagram.com" in lower:
         increment_usage(user_id)
-        clean_url = re.sub(r"[?&](utm_|igshid|stkn|igsh)=[^&]+", "", text)
-        clean_url = clean_url.split("?")[0].rstrip("/")
-        
-        text_parts = []
-        entities = []
-        current_offset = 0
-
-        def add_text(s: str):
-            nonlocal current_offset
-            text_parts.append(s)
-            current_offset += len(s.encode("utf-16-le")) // 2
-
-        def add_custom(emoji_id: str, placeholder: str = "🔥"):
-            nonlocal current_offset
-            text_parts.append(placeholder)
-            length = len(placeholder.encode("utf-16-le")) // 2
-            entities.append(MessageEntity(
-                type=MessageEntity.CUSTOM_EMOJI,
-                offset=current_offset,
-                length=length,
-                custom_emoji_id=str(emoji_id)
-            ))
-            current_offset += length
-
-        add_text("Downloading from ")
-        add_custom("6201514939530618666")
-        add_text(" Instagram...")
-
-        status_text = await message.reply_text("".join(text_parts), entities=entities)
+        clean_url = re.sub(r"[?&](utm_|igshid|stkn|igsh)=[^&]+", "", text).split("?")[0].rstrip("/")
+        status_text = await message.reply_text("Downloading from Instagram...")
         status_emoji = await message.reply_text("⌛")
         
         unique_id = str(int(time.time() * 1000))
@@ -1359,10 +1177,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "no_warnings": True,
                     "format": "bv*+ba/b",
                     "merge_output_format": "mp4",
-                    "postprocessors": [{
-                        "key": "FFmpegVideoConvertor",
-                        "preferedformat": "mp4",
-                    }],
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(clean_url, download=True)
@@ -1373,61 +1187,48 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if os.path.exists(candidate):
                             paths.append(candidate)
                             break
-                    if not paths and os.path.exists(filename):
-                        paths = [filename]
             if paths:
                 images = [p for p in paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
                 videos = [p for p in paths if p.lower().endswith((".mp4", ".mkv", ".webm"))]
                 if images:
-                    media = [InputMediaPhoto(open(p, "rb")) for p in images[:10]]
+                    opened = [open(p, "rb") for p in images[:10]]
+                    media = [InputMediaPhoto(f) for f in opened]
                     await message.reply_media_group(media=media)
+                    for f in opened:
+                        f.close()
                 for v in videos:
-                    await safe_send_video(
-                        message, v, "✨ Instagram video", unique_id
-                    )
-                try:
-                    await status_text.delete()
-                    await status_emoji.delete()
-                except:
-                    pass
-            else:
-                try:
-                    await status_text.edit_text("❌ Failed. Make sure link is public.")
-                    await status_emoji.delete()
-                except:
-                    pass
-        except Exception as e:
-            print(f"IG error: {e}")
-            try:
-                await status_text.edit_text("❌ Failed to download.")
+                    await safe_send_video(message, v, "✨ Instagram video", unique_id)
+                await status_text.delete()
                 await status_emoji.delete()
-            except:
-                pass
+            else:
+                await status_text.edit_text("❌ Download failed. Ensure post is public.")
+                await status_emoji.delete()
+        except Exception as e:
+            print(f"IG error: {e}", flush=True)
+            await status_text.edit_text("❌ Download error.")
+            await status_emoji.delete()
         finally:
             for p in paths:
-                try:
-                    os.remove(p)
-                except:
-                    pass
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
             folder = f"temp_{unique_id}"
             if os.path.exists(folder):
                 try:
                     shutil.rmtree(folder, ignore_errors=True)
-                except:
+                except Exception:
                     pass
-            for f in os.listdir("."):
-                if f.startswith(f"ig_{unique_id}"):
-                    try:
-                        os.remove(f)
-                    except:
-                        pass
         return
-    await message.reply_text("❌ Only 📸 Instagram, 🎵 TikTok and 𝕏 Twitter/X links are supported.")
+
+    await message.reply_text("❌ Unsupported URL platform.")
 
 # ------------------------------------------------------
 # Main
 # ------------------------------------------------------
 def main():
+    print(f"Checking environment... FFmpeg available: {check_ffmpeg()}", flush=True)
     init_db()
     keep_alive()
     app = (
@@ -1439,26 +1240,23 @@ def main():
         .pool_timeout(60.0)
         .build()
     )
-    # Normal commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("how", how))
     app.add_handler(CommandHandler("buy", buy))
-    # Admin commands
     app.add_handler(CommandHandler("freeall", freeall))
     app.add_handler(CommandHandler("removefreeall", removefreeall))
     app.add_handler(CommandHandler("freeuser", freeuser))
     app.add_handler(CommandHandler("removefree", removefree))
     app.add_handler(CommandHandler("status", status))
-    # Payment handlers
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="^buy_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_image))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    print("Bot started successfully...")
+    print("Bot loop started.", flush=True)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
