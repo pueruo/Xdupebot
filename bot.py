@@ -44,6 +44,14 @@ if not BOT_TOKEN:
 ADMIN_USERNAME = "pvnuo"
 DAILY_FREE_LIMIT = 5
 DB_FILE = "bot_data.db"
+
+# Temporary hard-coded lifetime free (free tier DB reset ke liye)
+# Yahan un users ke Telegram user_id daalo jo lifetime free rakhne hain
+HARDCODED_LIFETIME_FREE = [
+    # example:
+    # 123456789,
+    # 987654321,
+]
 # ====================================================
 
 # ------------------------------------------------------
@@ -98,6 +106,8 @@ def set_global_free(enabled: bool):
     conn.close()
 
 def is_lifetime_free(user_id: int) -> bool:
+    if user_id in HARDCODED_LIFETIME_FREE:
+        return True
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT 1 FROM lifetime_free WHERE user_id = ?", (user_id,))
@@ -222,7 +232,7 @@ def keep_alive():
     t.start()
 
 # ------------------------------------------------------
-# Image enhance (strong + no content loss)
+# Image enhance (stronger dirty unique)
 # ------------------------------------------------------
 def enhance_image(image: Image.Image) -> Image.Image:
     if image.mode != "RGB":
@@ -243,25 +253,29 @@ def enhance_image(image: Image.Image) -> Image.Image:
     clean = clean.resize((int(w * factor), int(h * factor)), Image.Resampling.LANCZOS)
     clean = clean.resize(original_size, Image.Resampling.LANCZOS)
 
-    noise = Image.effect_noise(clean.size, random.uniform(1.0, 2.0))
+    # stronger dirty unique look
+    noise = Image.effect_noise(clean.size, random.uniform(2.5, 4.5))
     noise = noise.convert("L")
-    noise = ImageEnhance.Brightness(noise).enhance(random.uniform(0.04, 0.09))
-    clean = Image.blend(clean, noise.convert("RGB"), random.uniform(0.02, 0.045))
+    noise = ImageEnhance.Brightness(noise).enhance(random.uniform(0.08, 0.15))
+    clean = Image.blend(clean, noise.convert("RGB"), random.uniform(0.04, 0.08))
 
     r, g, b = clean.split()
-    r = ImageEnhance.Brightness(r).enhance(random.uniform(0.996, 1.004))
-    g = ImageEnhance.Brightness(g).enhance(random.uniform(0.996, 1.004))
-    b = ImageEnhance.Brightness(b).enhance(random.uniform(0.996, 1.004))
+    r = ImageEnhance.Brightness(r).enhance(random.uniform(0.985, 1.015))
+    g = ImageEnhance.Brightness(g).enhance(random.uniform(0.985, 1.015))
+    b = ImageEnhance.Brightness(b).enhance(random.uniform(0.985, 1.015))
     clean = Image.merge("RGB", (r, g, b))
 
     clean = clean.filter(ImageFilter.UnsharpMask(
-        radius=random.uniform(0.6, 1.1),
-        percent=random.randint(60, 95),
-        threshold=2
+        radius=random.uniform(0.9, 1.4),
+        percent=random.randint(80, 120),
+        threshold=1
     ))
 
     enhancer = ImageEnhance.Contrast(clean)
-    clean = enhancer.enhance(random.uniform(1.015, 1.05))
+    clean = enhancer.enhance(random.uniform(1.04, 1.12))
+
+    enhancer = ImageEnhance.Color(clean)
+    clean = enhancer.enhance(random.uniform(0.97, 1.06))
 
     temp = io.BytesIO()
     clean.save(temp, format="PNG", optimize=True)
@@ -276,12 +290,46 @@ def enhance_image(image: Image.Image) -> Image.Image:
     return clean
 
 # ------------------------------------------------------
-# Video enhance (safe + strong + no content loss)
+# Video enhance (trim 0.6s + strong dirty unique)
 # ------------------------------------------------------
 def enhance_video(input_path: str, output_path: str) -> bool:
     if not shutil.which("ffmpeg"):
-        print("CRITICAL: ffmpeg binary not found in system PATH. Add NIXPACKS_PKGS=ffmpeg to Railway variables.", flush=True)
+        print("CRITICAL: ffmpeg binary not found in system PATH.", flush=True)
         return False
+
+    # Get duration first
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30
+        )
+        duration = float(probe.stdout.strip())
+    except Exception:
+        duration = 0
+
+    # Trim 0.6s from start and end if video long enough
+    trim_start = 0.6
+    trim_end = 0.6
+    if duration > (trim_start + trim_end + 1.0):
+        ss = trim_start
+        t = duration - trim_start - trim_end
+    else:
+        ss = 0
+        t = duration
+
+    # Strong unique dirty filter chain
+    vf = (
+        f"trim=start={ss}:duration={t},"
+        "setpts=PTS-STARTPTS,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+        "eq=contrast=1.08:brightness=0.02:saturation=1.05,"
+        "unsharp=5:5:0.8:3:3:0.4,"
+        "noise=alls=12:allf=t,"
+        "hue=h=2:s=1.03,"
+        "curves=vintage,"
+        "format=yuv420p"
+    )
 
     cmd = [
         "ffmpeg", "-y",
@@ -292,12 +340,12 @@ def enhance_video(input_path: str, output_path: str) -> bool:
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-threads", "2",
-        "-crf", "20",
+        "-crf", "19",
         "-c:a", "aac",
         "-b:a", "192k",
         "-movflags", "+faststart",
         "-pix_fmt", "yuv420p",
-        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-vf", vf,
         output_path
     ]
     try:
@@ -780,7 +828,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mentioned and not is_reply:
             return
 
-    # Standalone ⌛ triggers Telegram's animated sticker
     status_msg = await message.reply_text("⌛")
     start_time = time.time()
     try:
@@ -834,15 +881,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mentioned and not is_reply:
             return
 
-    # Standalone ⌛ triggers Telegram's animated sticker
     status_msg = await message.reply_text("⌛")
     
-    # Validation 1: Verify FFmpeg is present
     if not shutil.which("ffmpeg"):
-        await status_msg.edit_text("❌ Server error: FFmpeg not installed. Set NIXPACKS_PKGS=ffmpeg in Railway.")
+        await status_msg.edit_text("❌ Server error: FFmpeg not installed.")
         return
 
-    # Validation 2: Telegram Bot API 20 MB download limit guard
     target_obj = message.video or (message.document if message.document and "video" in (message.document.mime_type or "") else None)
     if not target_obj:
         await status_msg.edit_text("❌ Unsupported video format.")
